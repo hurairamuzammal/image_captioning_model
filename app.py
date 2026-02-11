@@ -60,29 +60,51 @@ class Decoder(nn.Module):
 
     def beam_search(self, feature, vocab, beam=3, max_len=20):
         device = feature.device
-        # Start token
-        seqs = [[ [vocab['<start>']], 0.0 ]]
+        batch = feature.size(0)
+        # 1. Initialize with Image Feature
+        # Note: feature shape should be (1, dim)
+        out, state = self.lstm(feature.unsqueeze(1))
+        
+        # seqs = [(sequence, score, state)]
+        # sequence is a list of token IDs
+        seqs = [[ [vocab['<start>']], 0.0, state ]]
 
         for _ in range(max_len):
             all_cands = []
-            for seq, score in seqs:
+            for seq, score, hidden_state in seqs:
                 if seq[-1] == vocab['<end>']:
-                    all_cands.append([seq, score])
+                    all_cands.append([seq, score, hidden_state])
                     continue
 
-                inp = torch.tensor(seq, device=device).unsqueeze(0)
+                # Prepare input for next step (just the last token)
+                # (1, 1)
+                inp = torch.tensor([seq[-1]], device=device).unsqueeze(0)
                 emb = self.embed(inp)
-                out,_ = self.lstm(emb)
-                logits = self.fc(out[:,-1,:])
+                
+                # Run LSTM for one step
+                out, new_state = self.lstm(emb, hidden_state)
+                
+                # Predict
+                logits = self.fc(out[:, -1, :])
                 logp = torch.log_softmax(logits, dim=1)
-                topk = torch.topk(logp, beam)
+                
+                # Get top k
+                topk = torch.topk(logp, beam) # (1, beam)
 
                 for k in range(beam):
-                    cand = seq + [topk.indices[0,k].item()]
-                    sc = score + topk.values[0,k].item()
-                    all_cands.append([cand, sc])
+                    token_idx = topk.indices[0, k].item()
+                    token_prob = topk.values[0, k].item()
+                    
+                    cand_seq = seq + [token_idx]
+                    cand_score = score + token_prob
+                    all_cands.append([cand_seq, cand_score, new_state])
 
+            # Select top beam candidates
             seqs = sorted(all_cands, key=lambda x: x[1], reverse=True)[:beam]
+            
+            # Check if all top candidates have ended (optimization)
+            if all(s[0][-1] == vocab['<end>'] for s in seqs):
+                break
 
         return seqs[0][0]
 
