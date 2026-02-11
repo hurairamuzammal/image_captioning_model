@@ -197,12 +197,43 @@ except Exception as e:
     st.error(f"Error loading models: {e}")
     st.stop()
 
-# Image Upload
-uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png"])
+# Image Source Selection
+st.write("### Select an Image Source")
+option = st.radio("Choose source:", ("Upload Image", "Sample Images"))
 
-if uploaded_file:
-    image = Image.open(uploaded_file).convert("RGB")
-    st.image(image, caption='Uploaded Image', use_container_width=True)
+image = None
+
+if option == "Upload Image":
+    uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png"])
+    if uploaded_file:
+        image = Image.open(uploaded_file).convert("RGB")
+else:
+    # Sample Images
+    sample_dir = "samples"
+    if os.path.exists(sample_dir):
+        sample_files = [f for f in os.listdir(sample_dir) if f.endswith(('.jpg', '.jpeg', '.png'))]
+        if sample_files:
+            # Display samples in a grid
+            cols = st.columns(len(sample_files))
+            for i, file_name in enumerate(sample_files):
+                img_path = os.path.join(sample_dir, file_name)
+                img = Image.open(img_path).convert("RGB")
+                with cols[i]:
+                    st.image(img, use_container_width=True)
+                    if st.button(f"Select Sample {i+1}", key=f"sample_{i}"):
+                        st.session_state['selected_sample'] = img_path
+            
+            # Load selected sample if exists in session state
+            if 'selected_sample' in st.session_state:
+                image = Image.open(st.session_state['selected_sample']).convert("RGB")
+                st.info(f"Selected: {os.path.basename(st.session_state['selected_sample'])}")
+        else:
+            st.warning("No sample images found in 'samples' directory.")
+    else:
+        st.warning("'samples' directory not found.")
+
+if image:
+    st.image(image, caption='Selected Image', use_container_width=True)
 
     if st.button("Generate Caption"):
         with st.spinner("Generating..."):
@@ -221,22 +252,8 @@ if uploaded_file:
                 # 3. Decode
                 with torch.no_grad():
                     if use_beam_search:
-                        # Beam Search (Note: Decoder.beam_search takes feature, not enc_out in current notebook code? 
-                        # Wait, notebook code: f = encoder(feat); decoder.beam_search(f[0:1], vocab)
-                        # So it takes encoded features.
-                        
-                        # In Notebook:
-                        # feat = torch.tensor(features[name]).unsqueeze(0).to(device)
-                        # f = encoder(feat)
-                        # greedy_tokens = decoder.greedy_search(f, vocab)
-                        
-                        # So 'features' arg in decoder methods is actually 'encoded_features'
-                        
                         tokens = decoder.beam_search(enc_out, vocab, beam=beam_width)
-                        # Beam search returns a list of token ids
                     else:
-                        # Greedy Search
-                        # Returns tensor of shape (batch, seq_len)
                         tokens_tensor = decoder.greedy_search(enc_out, vocab, repetition_penalty=scaling_factor)
                         tokens = tokens_tensor[0].cpu().tolist()
 
