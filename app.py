@@ -7,159 +7,99 @@ import pickle
 import json
 import os
 
-# --- Model Classes (Directly from Notebook) ---
+# --- NEW Model Classes (Init-Injection Architecture) ---
 
-class Encoder(nn.Module):
-    def __init__(self):
+class LSTMEncoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers=1, dropout=0.5):
+        super(LSTMEncoder, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.feature_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        self.h_init = nn.Linear(hidden_dim, hidden_dim * num_layers)
+        self.c_init = nn.Linear(hidden_dim, hidden_dim * num_layers)
+
+    def forward(self, images):
+        features = self.feature_proj(images)
+        h0 = self.h_init(features).view(-1, self.num_layers, self.hidden_dim).permute(1, 0, 2).contiguous()
+        c0 = self.c_init(features).view(-1, self.num_layers, self.hidden_dim).permute(1, 0, 2).contiguous()
+        return h0, c0
+
+class LSTMDecoder(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_dim, num_layers=1, dropout=0.5):
+        super(LSTMDecoder, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        self.lstm = nn.LSTM(embed_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout if num_layers > 1 else 0)
+        self.linear = nn.Linear(hidden_dim, vocab_size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, captions, h0, c0):
+        embeds = self.dropout(self.embedding(captions))
+        lstm_out, _ = self.lstm(embeds, (h0, c0))
+        outputs = self.linear(lstm_out)
+        return outputs
+
+class ImageCaptioningModel(nn.Module):
+    def __init__(self, encoder, decoder, device):
         super().__init__()
-        self.fc = nn.Linear(2048, 512)
+        self.encoder = encoder
+        self.decoder = decoder
+        self.device = device
 
-    def forward(self, x):
-        return torch.tanh(self.fc(x))
-
-class Decoder(nn.Module):
-    def __init__(self, vocab_size, embed_dim=512, hidden_dim=512):
-        super().__init__()
-        self.embed = nn.Embedding(vocab_size, embed_dim)
-        self.lstm = nn.LSTM(embed_dim, hidden_dim, batch_first=True)
-        self.fc = nn.Linear(hidden_dim, vocab_size)
-
-    def forward(self, features, captions):
-        emb = self.embed(captions[:, :-1])
-        x = torch.cat([features.unsqueeze(1), emb], dim=1)
-        out, _ = self.lstm(x)
-        return self.fc(out)
-
-    def greedy_search(self, features, vocab, max_len=20, repetition_penalty=1.0):
-        device = features.device
-        batch = features.size(0)
-        caps = torch.full((batch, 1), vocab['<start>'], device=device, dtype=torch.long)
-
-        out, state = self.lstm(features.unsqueeze(1))
-
-        for _ in range(max_len):
-            emb = self.embed(caps[:, -1:])
-            out, state = self.lstm(emb, state)
-            logits = self.fc(out[:, -1, :])
-
-
-            if repetition_penalty != 1.0:
-                for i in range(batch):
-                    for prev_token in caps[i]:
-                         if prev_token.item() == vocab.get('<pad>', 0): continue
-                         if logits[i, prev_token] < 0:
-                            logits[i, prev_token] *= repetition_penalty
-                         else:
-                            logits[i, prev_token] /= repetition_penalty
-
-            pred = torch.argmax(logits, dim=1)
-            caps = torch.cat([caps, pred.unsqueeze(1)], dim=1)
-            if (pred == vocab['<end>']).all():
-                break
-        return caps
-
-    def beam_search(self, feature, vocab, beam=3, max_len=20):
-        device = feature.device
-        batch = feature.size(0)
-        # 1. Initialize with Image Feature
-        # Note: feature shape should be (1, dim)
-        out, state = self.lstm(feature.unsqueeze(1))
-        
-        # seqs = [(sequence, score, state)]
-        # sequence is a list of token IDs
-        seqs = [[ [vocab['<start>']], 0.0, state ]]
-
-        for _ in range(max_len):
-            all_cands = []
-            for seq, score, hidden_state in seqs:
-                if seq[-1] == vocab['<end>']:
-                    all_cands.append([seq, score, hidden_state])
-                    continue
-
-                # Prepare input for next step (just the last token)
-                # (1, 1)
-                inp = torch.tensor([seq[-1]], device=device).unsqueeze(0)
-                emb = self.embed(inp)
-                
-                # Run LSTM for one step
-                out, new_state = self.lstm(emb, hidden_state)
-                
-                # Predict
-                logits = self.fc(out[:, -1, :])
-                logp = torch.log_softmax(logits, dim=1)
-                
-                # Get top k
-                topk = torch.topk(logp, beam) # (1, beam)
-
-                for k in range(beam):
-                    token_idx = topk.indices[0, k].item()
-                    token_prob = topk.values[0, k].item()
-                    
-                    cand_seq = seq + [token_idx]
-                    cand_score = score + token_prob
-                    all_cands.append([cand_seq, cand_score, new_state])
-
-            # Select top beam candidates
-            seqs = sorted(all_cands, key=lambda x: x[1], reverse=True)[:beam]
-            
-            # Check if all top candidates have ended (optimization)
-            if all(s[0][-1] == vocab['<end>'] for s in seqs):
-                break
-
-        return seqs[0][0]
+    def forward(self, images, captions):
+        h0, c0 = self.encoder(images)
+        captions_input = captions[:, :-1]
+        outputs = self.decoder(captions_input, h0, c0)
+        return outputs
 
 # --- Configuration & Setup ---
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-ENCODER_PATH = "encoder.pth"
-DECODER_PATH = "decoder.pth"
-VOCAB_PATH = "vocab.pkl"
-CONFIG_PATH = "config.json"
+MODEL_PATH = "Model/model.pth"
+VOCAB_PATH = "Model/vocab.pkl"
+CONFIG_PATH = "Model/config.json"
 
 @st.cache_resource
 def load_resources():
-    # Load Config
-    if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, 'r') as f:
-            config = json.load(f)
-    else:
-        # Fallback config
-        config = {
-            'embed_dim': 512,
-            'hidden_dim': 512, # Note: using hidden_dim as per Decoder __init__
-            'vocab_size': None # Will be set from vocab
-        }
+    with open(CONFIG_PATH, 'r') as f:
+        config = json.load(f)
 
-    # Load Vocabulary
     with open(VOCAB_PATH, 'rb') as f:
-        vocab = pickle.load(f)
-    
-    idx2word = {i: w for w, i in vocab.items()}
-    vocab_size = len(vocab)
-    config['vocab_size'] = vocab_size
+        vocab_data = pickle.load(f)
 
-    # Initialize Models
-    encoder = Encoder().to(DEVICE)
-    decoder = Decoder(
-        vocab_size=vocab_size,
-        embed_dim=config.get('embed_dim', 512),
-        hidden_dim=config.get('hidden_dim', 512)
-    ).to(DEVICE)
+    stoi = vocab_data['stoi']
+    itos = vocab_data['itos']
+    if isinstance(itos, dict):
+        itos = {int(k): v for k, v in itos.items()}
+    vocab_size = config['vocab_size']
 
-    # Load Weights
-    encoder.load_state_dict(torch.load(ENCODER_PATH, map_location=DEVICE))
-    decoder.load_state_dict(torch.load(DECODER_PATH, map_location=DEVICE))
+    encoder = LSTMEncoder(
+        config['image_feature_dim'],
+        config['hidden_dim'],
+        config['encoder_layers'],
+        config['dropout']
+    )
+    decoder = LSTMDecoder(
+        vocab_size,
+        config['embedding_dim'],
+        config['hidden_dim'],
+        config['decoder_layers'],
+        config['dropout']
+    )
+    model = ImageCaptioningModel(encoder, decoder, DEVICE).to(DEVICE)
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+    model.eval()
 
-    encoder.eval()
-    decoder.eval()
-
-    # Feature Extractor (ResNet50)
     resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
     resnet = nn.Sequential(*list(resnet.children())[:-1])
     resnet = resnet.to(DEVICE)
     resnet.eval()
 
-    return resnet, encoder, decoder, vocab, idx2word
+    return resnet, model, stoi, itos
 
 def process_image(image):
     transform = transforms.Compose([
@@ -169,35 +109,75 @@ def process_image(image):
     ])
     return transform(image).unsqueeze(0).to(DEVICE)
 
-def tokens_to_words(tokens, vocab, idx2word):
-    words = []
-    for t in tokens:
-        if t not in [vocab['<pad>'], vocab['<start>'], vocab['<end>']]:
-            words.append(idx2word[t])
-    return words
+def generate_caption_greedy(model, image_feature, stoi, itos, max_len=30):
+    model.eval()
+    with torch.no_grad():
+        h0, c0 = model.encoder(image_feature)
+        inputs = torch.tensor([stoi["<START>"]]).unsqueeze(0).to(DEVICE)
+        caption = []
+        for _ in range(max_len):
+            embeds = model.decoder.embedding(inputs)
+            lstm_out, (h0, c0) = model.decoder.lstm(embeds, (h0, c0))
+            outputs = model.decoder.linear(lstm_out.squeeze(1))
+            unk_idx = stoi.get("<UNK>", -1)
+            if 0 <= unk_idx < outputs.shape[1]:
+                outputs[:, unk_idx] = float('-inf')
+            predicted = outputs.argmax(1)
+            if predicted.item() == stoi["<END>"]:
+                break
+            caption.append(itos[predicted.item()])
+            inputs = predicted.unsqueeze(0)
+    return " ".join(caption)
+
+def generate_caption_beam(model, image_feature, stoi, itos, beam_width=3, max_len=30):
+    model.eval()
+    with torch.no_grad():
+        h0, c0 = model.encoder(image_feature)
+        seqs = [[[stoi["<START>"]], 0.0, (h0, c0)]]
+        for _ in range(max_len):
+            all_cands = []
+            for seq, score, state in seqs:
+                if seq[-1] == stoi["<END>"]:
+                    all_cands.append([seq, score, state])
+                    continue
+                inp = torch.tensor([seq[-1]]).unsqueeze(0).to(DEVICE)
+                embeds = model.decoder.embedding(inp)
+                lstm_out, new_state = model.decoder.lstm(embeds, state)
+                logits = model.decoder.linear(lstm_out[:, -1, :])
+                unk_idx = stoi.get("<UNK>", -1)
+                if 0 <= unk_idx < logits.shape[1]:
+                    logits[:, unk_idx] = float('-inf')
+                logp = torch.log_softmax(logits, dim=1)
+                topk = torch.topk(logp, beam_width)
+                for k in range(beam_width):
+                    cand = seq + [topk.indices[0, k].item()]
+                    sc = score + topk.values[0, k].item()
+                    all_cands.append([cand, sc, new_state])
+            seqs = sorted(all_cands, key=lambda x: x[1], reverse=True)[:beam_width]
+            if all(s[0][-1] == stoi["<END>"] for s in seqs):
+                break
+        best = seqs[0][0]
+        words = [itos[i] for i in best if i not in [stoi["<START>"], stoi["<END>"], stoi["<PAD>"]]]
+    return " ".join(words)
 
 # --- Streamlit UI ---
 
 st.title("Image Captioning App")
 st.write("Upload an image to generate a caption.")
 
-# Sidebar Settings
 st.sidebar.header("Settings")
-scaling_factor = st.sidebar.slider("Repetition Penalty (Greedy Search)", 1.0, 2.0, 1.2, 0.1)
-use_beam_search = st.sidebar.checkbox("Use Beam Search", value=False)
+use_beam_search = st.sidebar.checkbox("Use Beam Search", value=True)
 beam_width = 3
 if use_beam_search:
     beam_width = st.sidebar.slider("Beam Width", 1, 10, 3, 1)
 
-# Load Models
 try:
-    resnet, encoder, decoder, vocab, idx2word = load_resources()
+    resnet, model, stoi, itos = load_resources()
     st.sidebar.success("Models Loaded!")
 except Exception as e:
     st.error(f"Error loading models: {e}")
     st.stop()
 
-# Image Source Selection
 st.write("### Select an Image Source")
 option = st.radio("Choose source:", ("Upload Image", "Sample Images"))
 
@@ -208,12 +188,10 @@ if option == "Upload Image":
     if uploaded_file:
         image = Image.open(uploaded_file).convert("RGB")
 else:
-    # Sample Images
     sample_dir = "samples"
     if os.path.exists(sample_dir):
         sample_files = [f for f in os.listdir(sample_dir) if f.endswith(('.jpg', '.jpeg', '.png'))]
         if sample_files:
-            # Display samples in a grid
             cols = st.columns(len(sample_files))
             for i, file_name in enumerate(sample_files):
                 img_path = os.path.join(sample_dir, file_name)
@@ -222,8 +200,6 @@ else:
                     st.image(img, use_container_width=True)
                     if st.button(f"Select Sample {i+1}", key=f"sample_{i}"):
                         st.session_state['selected_sample'] = img_path
-            
-            # Load selected sample if exists in session state
             if 'selected_sample' in st.session_state:
                 image = Image.open(st.session_state['selected_sample']).convert("RGB")
                 st.info(f"Selected: {os.path.basename(st.session_state['selected_sample'])}")
@@ -239,27 +215,16 @@ if image:
         with st.spinner("Generating..."):
             try:
                 img_tensor = process_image(image)
-                
-                # 1. Extract Features
+
                 with torch.no_grad():
                     features = resnet(img_tensor)
-                    features = features.view(features.size(0), -1) # Flatten (1, 2048)
-                
-                # 2. Encode
-                with torch.no_grad():
-                    enc_out = encoder(features)
-                
-                # 3. Decode
-                with torch.no_grad():
-                    if use_beam_search:
-                        tokens = decoder.beam_search(enc_out, vocab, beam=beam_width)
-                    else:
-                        tokens_tensor = decoder.greedy_search(enc_out, vocab, repetition_penalty=scaling_factor)
-                        tokens = tokens_tensor[0].cpu().tolist()
+                    features = features.view(features.size(0), -1)
 
-                # 4. Convert to Words
-                caption = " ".join(tokens_to_words(tokens, vocab, idx2word))
-                
+                if use_beam_search:
+                    caption = generate_caption_beam(model, features, stoi, itos, beam_width=beam_width)
+                else:
+                    caption = generate_caption_greedy(model, features, stoi, itos)
+
                 st.subheader("Caption:")
                 st.write(caption)
 

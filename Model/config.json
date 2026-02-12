@@ -1,0 +1,9 @@
+{
+  "image_feature_dim": 2048,
+  "embedding_dim": 512,
+  "hidden_dim": 512,
+  "encoder_layers": 1,
+  "decoder_layers": 1,
+  "dropout": 0.5,
+  "vocab_size": 7611
+}
