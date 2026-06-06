@@ -81,5 +81,21 @@ The model was trained on the **Flickr8k/Flickr30k** dataset. During training, we
 ## 🤝 Contributing
 Contributions are welcome! If you'd like to improve the model architecture, improve the UI, or add support for new datasets, feel free to open a Pull Request.
 
+## Notebooks
+
+- The `notebook/` directory contains training and evaluation notebooks used to train the model, evaluate metrics (BLEU-4, precision/recall/F1), and generate sample captions. Inspect the notebooks to see preprocessing, augmentation, training loops, and inference examples.
+
+## How it's built (tools & techniques)
+
+- Framework: PyTorch for model implementation and training.
+- Backbone: `ResNet50` (pretrained) for image feature extraction.
+- Decoder: Init-injection LSTM that initializes `h0`/`c0` from projected image features.
+- Inference: Greedy and Beam Search decoding implemented in notebooks and `app.py`.
+- Utilities: `torchvision`, `numpy`, `pandas`, and `nltk` for tokenization and metric computation.
+
+## Model files
+
+- Place the trained artifacts in `Model/`: `model.pth`, `vocab.pkl`, and `config.json`. Notebooks reference these files for loading and evaluation.
+
 ## 📄 License
 This project is licensed under the MIT License - see the `LICENSE` file for details.
